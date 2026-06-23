@@ -1,18 +1,15 @@
 {
   "name": "morning-digest-worker",
   "version": "1.0.0",
-  "description": "Runs at 6:30 AM CST daily — scans Gmail for news emails, summarizes with Claude, sends digest",
-  "type": "module",
+  "description": "Morning news digest — scans Gmail, summarizes with Claude, sends daily at 6:30 AM CST",
   "main": "server.js",
   "scripts": {
-    "start": "node server.js",
-    "dev": "node --watch server.js"
+    "start": "node server.js"
   },
   "engines": {
-    "node": ">=20.0.0"
+    "node": ">=18.0.0"
   },
   "dependencies": {
-    "@anthropic-ai/sdk": "^0.39.0",
     "express": "^4.19.2"
   }
 }
