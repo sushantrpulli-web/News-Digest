@@ -1,0 +1,17 @@
+services:
+  - type: web
+    name: morning-digest-worker
+    runtime: node
+    buildCommand: npm install
+    startCommand: npm start
+    envVars:
+      - key: ANTHROPIC_API_KEY
+        sync: false          # You'll paste this in Render's dashboard
+      - key: CRON_SECRET
+        sync: false          # You'll paste this in Render's dashboard
+      - key: DIGEST_LENGTH
+        value: standard
+      - key: DIGEST_TONE
+        value: neutral
+    plan: free               # Render free tier — spins down after 15min idle
+                             # cron-job.org ping keeps it warm
