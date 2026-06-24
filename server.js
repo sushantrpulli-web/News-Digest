@@ -6,35 +6,36 @@ app.use(express.json());
 
 const PORT = process.env.PORT || 3000;
 const ANTHROPIC_API_KEY = process.env.ANTHROPIC_API_KEY;
-const CRON_SECRET = process.env.CRON_SECRET;
+const CRON_SECRET = process.env.CRON_SECRET || "";
 const GMAIL_MCP_URL = "https://gmailmcp.googleapis.com/mcp/v1";
 
-// ─── Auth middleware ───────────────────────────────────────────────────────────
-function requireSecret(req, res, next) {
-  const token = req.headers["x-cron-secret"] || req.query.secret;
-  if (!CRON_SECRET || token !== CRON_SECRET) {
-    return res.status(401).json({ error: "Unauthorized" });
-  }
-  next();
-}
-
-// ─── Health check ──────────────────────────────────────────────────────────────
+// ─── Health check ─────────────────────────────────────────────────────────────
 app.get("/", (req, res) => {
-  res.json({
-    status: "ok",
-    service: "Morning Digest Worker",
-    nextRun: "6:30 AM CST daily",
-  });
+  res.json({ status: "ok", service: "Morning Digest Worker", nextRun: "6:30 AM CST daily" });
 });
 
-// ─── Main digest endpoint ──────────────────────────────────────────────────────
-app.post("/run-digest", requireSecret, async (req, res) => {
-  console.log(`[${new Date().toISOString()}] Digest triggered`);
+// ─── Test trigger (GET) — open this in browser to manually test ───────────────
+app.get("/run-digest", (req, res) => {
+  const token = req.query.secret || "";
+  if (CRON_SECRET && token !== CRON_SECRET) {
+    return res.status(401).json({ error: "Unauthorized — add ?secret=YOUR_SECRET to the URL" });
+  }
+  res.json({ status: "started", message: "Digest running — check your Gmail in ~60 seconds" });
+  runDigest().catch((err) => console.error("Digest failed:", err.message));
+});
+
+// ─── Cron trigger (POST) — called by cron-job.org ────────────────────────────
+app.post("/run-digest", (req, res) => {
+  const token = req.headers["x-cron-secret"] || req.headers["authorization"] || req.query.secret || "";
+  if (CRON_SECRET && token !== CRON_SECRET) {
+    return res.status(401).json({ error: "Unauthorized" });
+  }
+  console.log(`[${new Date().toISOString()}] Digest triggered via POST`);
   res.json({ status: "started", message: "Digest running in background" });
   runDigest().catch((err) => console.error("Digest failed:", err.message));
 });
 
-// ─── Anthropic API helper (no SDK, raw HTTPS) ──────────────────────────────────
+// ─── Anthropic API helper ─────────────────────────────────────────────────────
 function callAnthropic(body) {
   return new Promise((resolve, reject) => {
     const payload = JSON.stringify(body);
@@ -49,26 +50,21 @@ function callAnthropic(body) {
         "anthropic-version": "2023-06-01",
       },
     };
-
     const req = https.request(options, (res) => {
       let data = "";
       res.on("data", (chunk) => (data += chunk));
       res.on("end", () => {
-        try {
-          resolve(JSON.parse(data));
-        } catch (e) {
-          reject(new Error("Failed to parse API response: " + data));
-        }
+        try { resolve(JSON.parse(data)); }
+        catch (e) { reject(new Error("Bad API response: " + data.slice(0, 200))); }
       });
     });
-
     req.on("error", reject);
     req.write(payload);
     req.end();
   });
 }
 
-// ─── Core digest logic ─────────────────────────────────────────────────────────
+// ─── Core digest logic ────────────────────────────────────────────────────────
 async function runDigest() {
   const length = process.env.DIGEST_LENGTH || "standard";
   const tone = process.env.DIGEST_TONE || "neutral";
@@ -90,7 +86,7 @@ async function runDigest() {
     timeZone: "America/Chicago",
   });
 
-  // Step 1: Scan Gmail via MCP
+  // Step 1: Scan Gmail
   console.log("Step 1: Scanning Gmail...");
   let emailData = { emails: [], user_email: "" };
   try {
@@ -104,7 +100,6 @@ async function runDigest() {
 {"user_email":"string","emails":[{"sender":"string","subject":"string","topics":["string"],"body_preview":"string"}]}`
       }],
     });
-
     for (const block of scanResponse.content || []) {
       const text = block.type === "mcp_tool_result"
         ? block.content?.[0]?.text
@@ -113,44 +108,39 @@ async function runDigest() {
       const match = text.match(/\{[\s\S]*\}/);
       if (match) { try { emailData = JSON.parse(match[0]); break; } catch {} }
     }
+    console.log(`Found ${emailData.emails?.length || 0} emails, user: ${emailData.user_email}`);
   } catch (err) {
     console.error("Gmail scan error:", err.message);
   }
-
-  const emailCount = emailData.emails?.length || 0;
-  console.log(`Found ${emailCount} news emails`);
 
   // Step 2: Generate summary
   console.log("Step 2: Generating summary...");
   let digestText = "";
   try {
+    const emailCount = emailData.emails?.length || 0;
     const prompt = emailCount > 0
       ? `Here are news emails from Gmail for ${today}:\n\n${JSON.stringify(emailData.emails, null, 2)}\n\nCreate a morning digest. Length: ${lengthMap[length]}. Tone: ${toneMap[tone]}. Group by topic with headers like "=== TECHNOLOGY ===". Start with "Good morning!". No markdown asterisks.`
-      : `Create a morning news digest for ${today}. No overnight emails were found. Cover: Technology, AI, Business, Geopolitics. Length: ${lengthMap[length]}. Tone: ${toneMap[tone]}. Use headers like "=== TECHNOLOGY ===". Start with "Good morning!".`;
+      : `Create a morning news digest for ${today}. No overnight emails found. Cover: Technology, AI, Business, Geopolitics. Length: ${lengthMap[length]}. Tone: ${toneMap[tone]}. Use headers like "=== TECHNOLOGY ===". Start with "Good morning!".`;
 
     const summaryResponse = await callAnthropic({
       model: "claude-sonnet-4-6",
       max_tokens: 1000,
       messages: [{ role: "user", content: prompt }],
     });
-
     digestText = (summaryResponse.content || [])
-      .filter((b) => b.type === "text")
-      .map((b) => b.text)
-      .join("\n")
-      .trim();
+      .filter((b) => b.type === "text").map((b) => b.text).join("\n").trim();
+    console.log("Summary generated, length:", digestText.length);
   } catch (err) {
     console.error("Summary error:", err.message);
-    digestText = `Good morning!\n\nDigest ran at 6:30 AM on ${today} but hit an error generating the summary. Check Render logs.`;
+    digestText = `Good morning!\n\nDigest ran on ${today} but hit an error. Check Render logs.`;
   }
 
-  // Step 3: Send email via Gmail MCP
+  // Step 3: Send email
   console.log("Step 3: Sending email...");
   const subject = `☀️ Morning Digest — ${today}`;
   const htmlBody = buildEmailHtml(digestText, today);
-
   try {
-    await callAnthropic({
+    const sendResponse = await callAnthropic({
       model: "claude-sonnet-4-6",
       max_tokens: 200,
       mcp_servers: [{ type: "url", url: GMAIL_MCP_URL, name: "gmail-mcp" }],
@@ -159,13 +149,14 @@ async function runDigest() {
         content: `Send an email to ${emailData.user_email || "me"} with subject "${subject}" and this HTML body: ${htmlBody}. Use the Gmail send tool.`,
       }],
     });
-    console.log(`✓ Digest sent to ${emailData.user_email || "Gmail"}`);
+    console.log("Send response:", JSON.stringify(sendResponse.content?.map(b => b.type)));
+    console.log("✓ Digest sent!");
   } catch (err) {
     console.error("Email send error:", err.message);
   }
 }
 
-// ─── Email HTML builder ────────────────────────────────────────────────────────
+// ─── Email HTML builder ───────────────────────────────────────────────────────
 function buildEmailHtml(text, date) {
   const escaped = text
     .replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
@@ -188,7 +179,10 @@ function buildEmailHtml(text, date) {
 </div>`;
 }
 
-// ─── Start ─────────────────────────────────────────────────────────────────────
+// ─── Start ────────────────────────────────────────────────────────────────────
 app.listen(PORT, () => {
   console.log(`✓ Morning Digest Worker running on port ${PORT}`);
+  console.log(`  GET  / — health check`);
+  console.log(`  GET  /run-digest?secret=XXX — manual browser trigger`);
+  console.log(`  POST /run-digest — cron-job.org trigger`);
 });
